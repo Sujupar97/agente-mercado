@@ -1538,3 +1538,26 @@ async def get_trade_chart_data(
         markers=markers,
         price_lines=price_lines,
     )
+
+
+# ── Admin: Reset simulación ──────────────────────────────────
+@router.post("/admin/reset-simulation")
+async def reset_simulation(session: AsyncSession = Depends(get_session)):
+    """Resetea capital, trades y señales para reiniciar simulación limpia."""
+    from sqlalchemy import text
+
+    await session.execute(text(
+        "UPDATE agent_state SET capital_usd = 50.0, peak_capital_usd = 50.0, "
+        "total_pnl = 0, trades_executed_total = 0, trades_won = 0, trades_lost = 0, "
+        "positions_open = 0 "
+        "WHERE strategy_id IN ('s1_pullback_20_up', 's2_pullback_20_down')"
+    ))
+    await session.execute(text("DELETE FROM trades"))
+    await session.execute(text("DELETE FROM signals"))
+    await session.execute(text("DELETE FROM bitacora"))
+    await session.execute(text("DELETE FROM signal_outcomes"))
+    await session.execute(text("DELETE FROM improvement_rules"))
+    await session.execute(text("DELETE FROM improvement_cycles"))
+    await session.commit()
+
+    return {"status": "ok", "message": "Simulación reseteada: capital=$50, trades/signals/rules borrados"}
