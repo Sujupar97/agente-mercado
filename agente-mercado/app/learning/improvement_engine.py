@@ -256,18 +256,42 @@ class ImprovementEngine:
         }
 
     def _format_trades_for_prompt(self, trades: list[Trade]) -> str:
-        """Formatea trades para incluir en el prompt del LLM."""
+        """Formatea trades con datos técnicos completos para el LLM."""
         lines = []
         for t in trades:
             closed_at = t.closed_at or datetime.now(timezone.utc)
             hold_min = (closed_at - t.created_at).total_seconds() / 60
             pattern = getattr(t, "pattern_name", None) or "unknown"
-            lines.append(
+
+            # Línea básica
+            line = (
                 f"- {t.symbol} {t.direction} | patrón: {pattern} | "
                 f"hora: {t.created_at.hour:02d}:{t.created_at.minute:02d} UTC | "
                 f"P&L: ${t.pnl:.4f} | duración: {hold_min:.0f}min | "
-                f"size: ${t.size_usd:.2f}"
+                f"R:R: {t.risk_reward_ratio:.1f}" if t.risk_reward_ratio else ""
             )
+
+            # Datos técnicos de entrada
+            tech_parts = []
+            if t.entry_ema20_distance_atr is not None:
+                tech_parts.append(f"EMA20_dist: {t.entry_ema20_distance_atr:.2f} ATR")
+            if t.entry_sma200_distance_atr is not None:
+                tech_parts.append(f"SMA200_dist: {t.entry_sma200_distance_atr:.1f} ATR")
+            if t.entry_candle_body_pct is not None:
+                tech_parts.append(f"body: {t.entry_candle_body_pct:.0%}")
+            if t.entry_candle_upper_wick_pct is not None:
+                tech_parts.append(f"upper_wick: {t.entry_candle_upper_wick_pct:.0%}")
+            if t.entry_candle_lower_wick_pct is not None:
+                tech_parts.append(f"lower_wick: {t.entry_candle_lower_wick_pct:.0%}")
+            if t.entry_atr14 is not None:
+                tech_parts.append(f"ATR14: {t.entry_atr14:.5f}")
+            if t.entry_retrace_pct is not None:
+                tech_parts.append(f"retrace: {t.entry_retrace_pct:.0%}")
+
+            if tech_parts:
+                line += f"\n  Técnicos: {' | '.join(tech_parts)}"
+
+            lines.append(line)
         return "\n".join(lines) if lines else "Sin trades"
 
     def _persist_rule_to_claude_md(

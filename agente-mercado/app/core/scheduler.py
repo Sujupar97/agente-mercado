@@ -91,14 +91,14 @@ async def _run_context_cycle():
 
 
 async def _run_entry_cycle():
-    """Fase 2: Busca entradas en M5 para instrumentos listos."""
+    """Fase 2: Busca entradas en M1 para instrumentos listos."""
     orch = _ensure_orchestrator()
     if orch is None:
         return
     try:
         await orch.run_entry_cycle()
     except Exception:
-        log.exception("Error en ciclo de entrada M5")
+        log.exception("Error en ciclo de entrada M1")
 
 
 async def _run_position_sync():
@@ -130,12 +130,12 @@ async def start_scheduler() -> None:
         max_instances=1,
     )
 
-    # Job 2: Entradas M5 — cada 1 min
+    # Job 2: Entradas M1 — cada 1 min
     _scheduler.add_job(
         _run_entry_cycle,
         trigger=IntervalTrigger(minutes=1),
         id="entry_cycle",
-        name="Entradas M5 (pullback + patrón)",
+        name="Entradas M1 (pullback + patrón)",
         replace_existing=True,
         max_instances=1,
     )

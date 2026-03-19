@@ -33,7 +33,7 @@ class StrategyConfig:
     # Timeframes
     primary_timeframe: str = "H1"
     context_timeframe: str = "H4"
-    entry_timeframe: str = "M5"  # Timeframe para buscar entradas (Oliver Vélez)
+    entry_timeframe: str = "M1"  # Timeframe para buscar entradas (Oliver Vélez — M1 lo más cercano a M2)
 
     # Umbrales M5 para pullback detector
     m5_min_retrace_pct: float = 0.20  # 20% retrace (más bajo que H1)
@@ -51,7 +51,7 @@ class StrategyConfig:
     enabled: bool = True
 
     # Capital inicial (se sincroniza con broker al arrancar)
-    initial_capital_usd: float = 5_500.0  # Mitad del balance demo Capital.com
+    initial_capital_usd: float = 50.0  # $50 por estrategia para simulación
 
     # Learning
     trades_per_learning_report: int = 15

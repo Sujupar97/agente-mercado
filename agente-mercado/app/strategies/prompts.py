@@ -68,12 +68,22 @@ Responde en JSON array con exactamente {count} objetos:
 # PROMPT PARA CICLO DE MEJORA DE 20 TRADES
 # ═══════════════════════════════════════════════════════════
 
-IMPROVEMENT_ANALYSIS_PROMPT = """Eres un analista de trading revisando un ciclo de {total_trades} trades de la estrategia "{strategy_name}".
+IMPROVEMENT_ANALYSIS_PROMPT = """Eres un analista técnico profesional de Forex revisando un ciclo de {total_trades} trades de la estrategia "{strategy_name}".
 
 DESCRIPCION DE LA ESTRATEGIA:
 {strategy_description}
 
-Tu tarea: Identifica EL PATRON MAS RECURRENTE en los trades perdedores que NO aparece (o aparece mucho menos) en los ganadores. Solo UNO — el más claro y accionable.
+Tu tarea: Identifica EL PATRON TÉCNICO MÁS RECURRENTE en los trades perdedores que NO aparece (o aparece mucho menos) en los ganadores. Solo UNO — el más claro y accionable.
+
+CAMPOS TÉCNICOS DISPONIBLES EN CADA TRADE:
+- EMA20_dist: Distancia del precio a la EMA20, medida en múltiplos de ATR. Valores bajos (0.1-0.3) = pullback profundo cerca de EMA20. Valores altos (>1.0) = lejos de EMA20.
+- SMA200_dist: Distancia del precio a la SMA200, medida en múltiplos de ATR. Indica fuerza de la tendencia.
+- body: Porcentaje del rango de la vela que es cuerpo (vs mechas). Cuerpos grandes (>60%) = velas decisivas. Cuerpos pequeños (<30%) = indecisión.
+- upper_wick: Porcentaje del rango que es mecha superior. Mechas grandes = rechazo de precios altos.
+- lower_wick: Porcentaje del rango que es mecha inferior. Mechas grandes = rechazo de precios bajos.
+- ATR14: Volatilidad actual medida por ATR de 14 períodos.
+- retrace: Porcentaje de retroceso del pullback respecto al impulso previo. 20-50% = pullback saludable. >60% = pullback excesivo.
+- R:R: Risk-reward ratio al momento de entrada.
 
 TRADES GANADORES ({wins_count}):
 {winners_data}
@@ -85,24 +95,31 @@ REGLAS YA EXISTENTES (NO repetir estas):
 {existing_rules}
 
 INSTRUCCIONES:
-1. Analiza los trades perdedores buscando patrones comunes (hora, símbolo, patrón técnico, duración, condiciones de mercado).
-2. Compara con los ganadores: el patrón debe ser significativamente más frecuente en perdedores.
-3. Genera UNA regla técnica evaluable que prevenga este patrón.
-4. La regla debe ser ESPECÍFICA y EVALUABLE programáticamente.
+1. COMPARA las métricas técnicas de ganadores vs perdedores. Busca diferencias estadísticas claras:
+   - ¿Los perdedores tienen EMA20_dist más alto o más bajo?
+   - ¿Los perdedores tienen cuerpos de vela más pequeños (indecisión)?
+   - ¿Los perdedores tienen mechas más grandes (rechazo)?
+   - ¿Los perdedores están más lejos/cerca de SMA200?
+   - ¿Los perdedores tienen retrace% excesivo?
+2. El patrón debe ser CUANTIFICABLE con umbrales específicos.
+3. PRIORIZA reglas técnicas (ema20_distance_filter, candle_quality_filter, sma200_distance_filter) sobre reglas de hora o sesión.
+4. La regla debe ser ESPECÍFICA con umbrales numéricos basados en los datos.
 
 Responde en JSON:
 {{
   "pattern_name": "nombre_corto_del_patron",
-  "description": "Descripción clara en español de qué patrón se identificó",
-  "evidence": "X de Y trades perdedores muestran este patrón vs Z de W ganadores",
-  "rule_type": "time_filter|pattern_filter|condition_filter|volume_filter",
+  "description": "Descripción clara en español de qué patrón técnico se identificó con umbrales",
+  "evidence": "Comparación cuantitativa: 'Perdedores promedio EMA20_dist=X vs ganadores=Y'",
+  "rule_type": "ema20_distance_filter|candle_quality_filter|sma200_distance_filter|time_filter|pattern_filter|condition_filter|session_filter",
   "condition": {{
-    // Varía según rule_type:
+    // ema20_distance_filter: {{"min_ema20_distance_atr": 0.05, "max_ema20_distance_atr": 0.80}}
+    // candle_quality_filter: {{"min_body_pct": 0.40, "max_upper_wick_pct": 0.40, "max_lower_wick_pct": 0.40}}
+    // sma200_distance_filter: {{"min_sma200_distance_atr": 1.0, "max_sma200_distance_atr": 15.0}}
     // time_filter: {{"forbidden_hours": [2, 3, 4]}}
-    // pattern_filter: {{"forbidden_patterns": ["narrow_range_bars"]}}
-    // condition_filter: {{"min_confidence": 0.60, "forbidden_symbols": ["DOGE/USDT"]}}
-    // volume_filter: {{"min_volume_ratio": 1.5}}
+    // pattern_filter: {{"forbidden_patterns": ["PIN_BAR_BAJISTA"]}}
+    // condition_filter: {{"min_confidence": 0.60, "forbidden_instruments": ["USD_JPY"]}}
+    // session_filter: {{"forbidden_sessions": ["TOKYO"]}}
   }},
   "confidence": 0.0-1.0,
-  "expected_improvement": "Estimación de cuánto mejoraría el win rate si se aplica esta regla"
+  "expected_improvement": "Estimación cuantitativa del impacto (ej: 'filtraría 5/8 pérdidas manteniendo 6/7 ganadores')"
 }}"""

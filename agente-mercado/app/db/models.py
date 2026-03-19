@@ -129,6 +129,15 @@ class Trade(Base):
     market_state_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     exit_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
+    # Datos técnicos de entrada (para improvement engine)
+    entry_ema20_distance_atr: Mapped[float | None] = mapped_column(Float, nullable=True)
+    entry_sma200_distance_atr: Mapped[float | None] = mapped_column(Float, nullable=True)
+    entry_candle_body_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    entry_candle_upper_wick_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    entry_candle_lower_wick_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    entry_atr14: Mapped[float | None] = mapped_column(Float, nullable=True)
+    entry_retrace_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

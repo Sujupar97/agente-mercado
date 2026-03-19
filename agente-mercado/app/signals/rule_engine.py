@@ -2,7 +2,7 @@
 
 Arquitectura multi-timeframe:
 - Fase 1 (cada 15 min): H1/H4 → MarketState → 8 filtros de contexto → cachear
-- Fase 2 (cada 1 min): M5 → pullback + patrón → señal → ejecución
+- Fase 2 (cada 1 min): M1 → pullback + patrón → señal → ejecución
 
 Flujo legacy (generate_signals) sigue funcionando como wrapper.
 """
@@ -57,7 +57,10 @@ class ForexSignal:
     filter_result: FilterResult
     pullback_result: PullbackResult
 
-    # Timeframe de entrada (H1 legacy, M5 nuevo)
+    # Vela de entrada (para datos técnicos en improvement engine)
+    entry_candle: Candle | None = None
+
+    # Timeframe de entrada (H1 legacy, M1 nuevo)
     entry_timeframe: str = "H1"
 
     created_at: datetime = None  # type: ignore
@@ -200,21 +203,21 @@ class ForexSignalGenerator:
 
         return results
 
-    # ── Fase 2: Entradas en M5 ─────────────────────────────────
+    # ── Fase 2: Entradas en M1 ─────────────────────────────────
 
     def scan_entries(
         self,
         context_results: dict[str, ContextResult],
         m5_data: dict[str, list[Candle]],
     ) -> list[ForexSignal]:
-        """Fase 2: Busca pullback + patrón en M5 para instrumentos listos.
+        """Fase 2: Busca pullback + patrón en timeframe de entrada para instrumentos listos.
 
         Solo se llama para instrumentos que ya pasaron check_context().
         Se ejecuta cada 1 min.
 
         Args:
             context_results: Resultado cacheado de check_context()
-            m5_data: {"EUR_USD": [Candle M5, ...], ...}
+            m5_data: {"EUR_USD": [Candle, ...], ...} (M1 o M5 según config)
         """
         direction = self._config.direction
         signals: list[ForexSignal] = []
@@ -254,7 +257,8 @@ class ForexSignalGenerator:
             if signal is None:
                 continue
 
-            signal.entry_timeframe = "M5"
+            signal.entry_timeframe = self._config.entry_timeframe
+            signal.entry_candle = candles_m5[-1] if candles_m5 else None
 
             # Improvement rules
             if not self._passes_improvement_rules(signal):
@@ -321,6 +325,8 @@ class ForexSignalGenerator:
 
         if signal is None:
             return None
+
+        signal.entry_candle = candles_h1[-1] if candles_h1 else None
 
         # 6. Filtrar por improvement rules
         if not self._passes_improvement_rules(signal):
@@ -427,5 +433,43 @@ class ForexSignalGenerator:
                 from app.forex.sessions import get_current_session
                 if get_current_session() in forbidden_sessions:
                     return False
+
+            elif rule.rule_type == "ema20_distance_filter":
+                # Filtrar por distancia a EMA20 en múltiplos de ATR
+                if signal.pullback_result:
+                    dist = signal.pullback_result.distance_to_ema20_atr
+                    min_dist = condition.get("min_ema20_distance_atr", 0)
+                    max_dist = condition.get("max_ema20_distance_atr", float("inf"))
+                    if dist < min_dist or dist > max_dist:
+                        return False
+
+            elif rule.rule_type == "candle_quality_filter":
+                # Filtrar por calidad de la vela de entrada
+                if signal.entry_candle:
+                    candle = signal.entry_candle
+                    rng = candle.high - candle.low
+                    if rng > 0:
+                        body = abs(candle.close - candle.open)
+                        body_pct = body / rng
+                        min_body = condition.get("min_body_pct", 0)
+                        if body_pct < min_body:
+                            return False
+                        max_upper_wick = condition.get("max_upper_wick_pct", 1.0)
+                        upper_wick = (candle.high - max(candle.open, candle.close)) / rng
+                        if upper_wick > max_upper_wick:
+                            return False
+                        max_lower_wick = condition.get("max_lower_wick_pct", 1.0)
+                        lower_wick = (min(candle.open, candle.close) - candle.low) / rng
+                        if lower_wick > max_lower_wick:
+                            return False
+
+            elif rule.rule_type == "sma200_distance_filter":
+                # Filtrar por distancia a SMA200 en múltiplos de ATR
+                if signal.market_state_h1 and signal.market_state_h1.atr14 > 0:
+                    dist = abs(signal.market_state_h1.price - signal.market_state_h1.sma200) / signal.market_state_h1.atr14
+                    min_dist = condition.get("min_sma200_distance_atr", 0)
+                    max_dist = condition.get("max_sma200_distance_atr", float("inf"))
+                    if dist < min_dist or dist > max_dist:
+                        return False
 
         return True

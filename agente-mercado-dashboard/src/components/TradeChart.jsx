@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { createChart, ColorType, LineStyle } from 'lightweight-charts';
+import { createChart, ColorType, LineStyle, CandlestickSeries } from 'lightweight-charts';
 import { api } from '../api/endpoints';
 import { XMarkIcon } from '@heroicons/react/24/outline';
 
@@ -71,7 +71,7 @@ export function TradeChart({ tradeId, onClose }) {
     chartRef.current = chart;
 
     // Candlestick series
-    const candleSeries = chart.addCandlestickSeries({
+    const candleSeries = chart.addSeries(CandlestickSeries, {
       upColor: '#22c55e',
       downColor: '#ef4444',
       borderDownColor: '#ef4444',

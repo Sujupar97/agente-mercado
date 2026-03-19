@@ -7,7 +7,7 @@
 - **Broker**: OANDA (demo: `api-fxpractice.oanda.com`, live: `api-fxtrade.oanda.com`)
 - **HTTP Client**: httpx (async) para comunicacion con OANDA
 - **Instrumentos**: EUR_USD, GBP_USD, USD_JPY, XAU_USD
-- **Timeframes**: H1 (primario), H4 (contexto)
+- **Timeframes**: H1 (primario), H4 (contexto), M1 (entrada — lo más cercano a M2)
 
 ## Principios Fundamentales
 
@@ -56,6 +56,8 @@
 
 ## 8 Filtros de Contexto (TODOS deben pasar)
 
+1. [Ciclo #1] Alta concentración de trades perdedores en la ventana de apertura de mercado (11:30 - 12:05 UTC), donde la volatilidad inicial genera falsos pullbacks a la EMA20 que son rápidamente revertidos.
+
 ### Para S1 (LONG):
 1. `trend_state_H1 == "UP"`
 2. `trend_state_H4 != "DOWN"`
@@ -91,11 +93,11 @@ Si **cualquier** filtro falla → no se busca senal.
 3. Correr 8 filtros de contexto → cachear instrumentos que pasan
 4. Resultado: lista de instrumentos "listos" por estrategia
 
-### Fase 2: Entradas M5 (cada 1 min)
-1. Para instrumentos listos: Fetch candles M5 (100)
-2. Construir MarketState M5 (sin SMA200, solo EMA20 + ATR14)
+### Fase 2: Entradas M1 (cada 1 min)
+1. Para instrumentos listos: Fetch candles M1 (100)
+2. Construir MarketState M1 (sin SMA200, solo EMA20 + ATR14)
 3. Detectar pullback a EMA20 (retrace >= 20% impulso, |price - EMA20| <= 0.50 ATR)
-4. Buscar patron de entrada en ultimas 5 velas M5
+4. Buscar patron de entrada en ultimas 5 velas M1
 5. Si hay patron, calcular stop y verificar R:R >= 2:1
 6. Aplicar filtro de improvement rules
 7. Generar senal → ejecutar orden en broker

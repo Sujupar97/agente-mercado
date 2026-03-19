@@ -119,10 +119,10 @@ class ForexOrchestrator:
         except Exception:
             log.exception("Error en ciclo de contexto")
 
-    # ── Fase 2: Entradas M5 (cada 1 min) ──────────────────────
+    # ── Fase 2: Entradas M1 (cada 1 min) ──────────────────────
 
     async def run_entry_cycle(self) -> None:
-        """Busca entradas en M5 para instrumentos que pasaron contexto."""
+        """Busca entradas en M1 para instrumentos que pasaron contexto."""
         cycle_start = datetime.now(timezone.utc)
 
         if not is_forex_market_open():
@@ -149,7 +149,7 @@ class ForexOrchestrator:
                 # Gestionar posiciones abiertas
                 await self._manage_positions(session)
 
-                # Buscar entradas M5 para cada estrategia
+                # Buscar entradas para cada estrategia
                 total_trades = 0
                 for strategy_id, config in STRATEGIES.items():
                     if not config.enabled:
@@ -159,14 +159,14 @@ class ForexOrchestrator:
                     if not context:
                         continue
 
-                    # Fetch M5 solo para instrumentos listos
+                    # Fetch candles de entrada solo para instrumentos listos
                     ready_instruments = list(context.keys())
-                    m5_data = await self._fetch_entry_candles(ready_instruments)
+                    m5_data = await self._fetch_entry_candles(ready_instruments, config.entry_timeframe)
 
                     if not m5_data:
                         continue
 
-                    # Generar señales M5
+                    # Generar señales
                     improvement_rules = await self._load_improvement_rules(
                         session, strategy_id,
                     )
@@ -197,7 +197,7 @@ class ForexOrchestrator:
                 log.info("Ciclo de entrada completado en %.1fs", elapsed)
 
         except Exception:
-            log.exception("Error en ciclo de entrada M5")
+            log.exception("Error en ciclo de entrada")
 
         self._cycle_count += 1
 
@@ -228,18 +228,18 @@ class ForexOrchestrator:
         return result
 
     async def _fetch_entry_candles(
-        self, instruments: list[str],
+        self, instruments: list[str], entry_timeframe: str = "M1",
     ) -> dict[str, list[Candle]]:
-        """Fetch candles M5 solo para instrumentos que pasaron contexto."""
+        """Fetch candles de entrada solo para instrumentos que pasaron contexto."""
         result: dict[str, list[Candle]] = {}
 
         for instrument in instruments:
             try:
-                candles = await self._broker.get_candles(instrument, "M5", 100)
+                candles = await self._broker.get_candles(instrument, entry_timeframe, 100)
                 if candles:
                     result[instrument] = candles
             except Exception:
-                log.exception("Error fetching M5 para %s", instrument)
+                log.exception("Error fetching %s para %s", entry_timeframe, instrument)
 
         return result
 
@@ -341,11 +341,14 @@ class ForexOrchestrator:
             log.exception("Error obteniendo precio de %s", signal.instrument)
             return False
 
-        # 4. Calcular position size
+        # 4. Obtener capital de la estrategia (NO del broker)
+        state = await self._ensure_state(session, strategy_id)
+
+        # 5. Calcular position size con capital de la estrategia
         stop_distance = abs(signal.entry_price - signal.stop_price)
         units = calculate_position_size(
             instrument=signal.instrument,
-            account_balance=account.balance,
+            account_balance=state.capital_usd,
             risk_pct=strategy_config.risk_per_trade_pct,
             stop_distance_price=stop_distance,
             current_price=price.mid,
@@ -393,8 +396,40 @@ class ForexOrchestrator:
         session.add(db_signal)
         await session.flush()
 
-        # 7. Registrar trade en DB
-        risk_amount = account.balance * strategy_config.risk_per_trade_pct
+        # 7. Calcular datos técnicos de entrada
+        risk_amount = state.capital_usd * strategy_config.risk_per_trade_pct
+
+        # EMA20 distance en ATR
+        ema20_dist_atr = None
+        if signal.pullback_result and hasattr(signal.pullback_result, "distance_to_ema20_atr"):
+            ema20_dist_atr = signal.pullback_result.distance_to_ema20_atr
+
+        # SMA200 distance en ATR
+        sma200_dist_atr = None
+        if signal.market_state_h1 and signal.market_state_h1.atr14 > 0:
+            sma200_dist_atr = abs(
+                signal.market_state_h1.price - signal.market_state_h1.sma200
+            ) / signal.market_state_h1.atr14
+
+        # Candle body/wick ratios
+        candle_body_pct = None
+        candle_upper_wick_pct = None
+        candle_lower_wick_pct = None
+        if signal.entry_candle:
+            c = signal.entry_candle
+            rng = c.high - c.low
+            if rng > 0:
+                candle_body_pct = abs(c.close - c.open) / rng
+                candle_upper_wick_pct = (c.high - max(c.open, c.close)) / rng
+                candle_lower_wick_pct = (min(c.open, c.close) - c.low) / rng
+
+        # ATR14 y retrace %
+        entry_atr14 = signal.market_state_h1.atr14 if signal.market_state_h1 else None
+        entry_retrace_pct = None
+        if signal.pullback_result and hasattr(signal.pullback_result, "retrace_pct"):
+            entry_retrace_pct = signal.pullback_result.retrace_pct
+
+        # 8. Registrar trade en DB
         trade = Trade(
             strategy_id=strategy_id,
             signal_id=db_signal.id,
@@ -419,6 +454,13 @@ class ForexOrchestrator:
             market_state_json=signal.market_state_h1.to_dict(),
             status="OPEN",
             is_simulation=settings.oanda_environment == "practice",
+            entry_ema20_distance_atr=ema20_dist_atr,
+            entry_sma200_distance_atr=sma200_dist_atr,
+            entry_candle_body_pct=candle_body_pct,
+            entry_candle_upper_wick_pct=candle_upper_wick_pct,
+            entry_candle_lower_wick_pct=candle_lower_wick_pct,
+            entry_atr14=entry_atr14,
+            entry_retrace_pct=entry_retrace_pct,
         )
         session.add(trade)
         await session.flush()
@@ -441,8 +483,7 @@ class ForexOrchestrator:
         )
         session.add(bitacora)
 
-        # 9. Actualizar AgentState
-        state = await self._ensure_state(session, strategy_id)
+        # 9. Actualizar AgentState (ya obtenido en paso 4)
         state.positions_open += 1
         state.trades_executed_total += 1
         state.last_trade_at = datetime.now(timezone.utc)
