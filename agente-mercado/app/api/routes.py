@@ -1425,9 +1425,7 @@ async def get_trade_chart_data(
 
     candles = []
     try:
-        from app.broker.capital import CapitalBroker
-
-        broker_chart = CapitalBroker()
+        broker_chart = await _get_broker()
         candles_raw = await broker_chart.get_candles(
             instrument, timeframe, count=count, from_dt=start_dt, to_dt=end_dt
         )
