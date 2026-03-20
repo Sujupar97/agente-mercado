@@ -1566,6 +1566,40 @@ async def get_trade_chart_data(
 
 
 # ── Admin: Reset simulación ──────────────────────────────────
+@router.post("/admin/sync-broker-balance")
+async def sync_broker_balance(session: AsyncSession = Depends(get_session)):
+    """Sincroniza broker_balance y base_capital_usd en AgentState (sin borrar datos)."""
+    from sqlalchemy import text
+
+    try:
+        broker = await _get_broker()
+        acct = await broker.get_account()
+        balance = acct.balance
+    except Exception:
+        return {"status": "error", "message": "No se pudo conectar al broker"}
+
+    # Actualizar broker_balance en todas las estrategias
+    await session.execute(text(
+        "UPDATE agent_state SET broker_balance = :bal, broker_equity = :bal "
+        "WHERE strategy_id IN ('s1_pullback_20_up', 's2_pullback_20_down')"
+    ).bindparams(bal=balance))
+
+    # Inicializar base_capital_usd si es NULL
+    await session.execute(text(
+        "UPDATE agent_state SET base_capital_usd = :bal, "
+        "next_threshold_usd = :threshold "
+        "WHERE base_capital_usd IS NULL"
+    ).bindparams(bal=balance, threshold=balance * 1.5))
+
+    await session.commit()
+    return {
+        "status": "ok",
+        "broker_balance": balance,
+        "base_capital_usd": balance,
+        "next_threshold_usd": balance * 1.5,
+    }
+
+
 @router.post("/admin/reset-simulation")
 async def reset_simulation(session: AsyncSession = Depends(get_session)):
     """Resetea capital, trades y señales para reiniciar simulación limpia."""
