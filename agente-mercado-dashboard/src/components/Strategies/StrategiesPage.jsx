@@ -44,7 +44,8 @@ export function StrategiesPage() {
   }
 
   // Summary stats
-  const totalCapital = strategies.reduce((sum, s) => sum + (s.capital_usd || 0), 0);
+  const brokerBalance = strategies.reduce((max, s) => Math.max(max, s.broker_balance || 0), 0);
+  const totalCapital = brokerBalance > 0 ? brokerBalance : strategies.reduce((sum, s) => sum + (s.capital_usd || 0), 0);
   const totalPnl = strategies.reduce((sum, s) => sum + (s.total_pnl || 0), 0);
   const totalTrades = strategies.reduce(
     (sum, s) => sum + s.trades_won + s.trades_lost,
@@ -83,7 +84,7 @@ export function StrategiesPage() {
       </div>
 
       {/* Strategy cards grid */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
         {strategies.map((strategy, i) => (
           <StrategyCard
             key={strategy.id}

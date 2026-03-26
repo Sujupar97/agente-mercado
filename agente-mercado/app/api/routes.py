@@ -755,6 +755,7 @@ async def get_strategies(
             win_rate=round(wr, 4),
             mode=state.mode if state else "UNKNOWN",
             last_trade_at=state.last_trade_at if state else None,
+            broker_balance=state.broker_balance if state else None,
             base_capital_usd=state.base_capital_usd if state else None,
             next_threshold_usd=state.next_threshold_usd if state else None,
             risk_per_trade_usd=(state.base_capital_usd * 0.01) if state and state.base_capital_usd else None,

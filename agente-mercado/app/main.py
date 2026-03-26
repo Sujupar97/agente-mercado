@@ -56,11 +56,34 @@ async def lifespan(app: FastAPI):
                 pass  # Columna ya existe o DB no soporta IF NOT EXISTS
     log.info("Tablas verificadas/creadas")
 
-    # Sembrar estrategias si la DB está vacía
+    # Retroactive fix: llenar bitácoras existentes con datos de trades cerrados
+    async with async_session_factory() as session:
+        from sqlalchemy import text as sql_text
+        try:
+            result = await session.execute(sql_text("""
+                UPDATE bitacora SET
+                    exit_reason = t.exit_reason,
+                    exit_price = t.exit_price,
+                    exit_time = t.closed_at,
+                    pnl = t.pnl,
+                    hold_duration_minutes = EXTRACT(EPOCH FROM (t.closed_at - bitacora.entry_time)) / 60
+                FROM trades t
+                WHERE bitacora.trade_id = t.id
+                    AND t.status = 'CLOSED'
+                    AND bitacora.pnl IS NULL
+            """))
+            await session.commit()
+            if result.rowcount > 0:
+                log.info("Bitácora: %d entries actualizadas retroactivamente con datos de salida", result.rowcount)
+        except Exception:
+            log.exception("Error en migración retroactiva de bitácora")
+
+    # Sembrar estrategias nuevas o faltantes
     async with async_session_factory() as session:
         from sqlalchemy import select, func
         result = await session.execute(select(func.count(Strategy.id)))
-        if result.scalar() == 0:
+        existing_count = result.scalar() or 0
+        if existing_count == 0:
             log.info("DB vacía — sembrando estrategias...")
             for sid, config in STRATEGIES.items():
                 session.add(Strategy(
@@ -84,6 +107,34 @@ async def lifespan(app: FastAPI):
                     peak_capital_usd=config.initial_capital_usd,
                 ))
                 log.info("  Sembrada: %s", config.id)
+            await session.commit()
+        else:
+            # DB ya tiene estrategias — verificar si hay nuevas en STRATEGIES
+            for sid, config in STRATEGIES.items():
+                existing = await session.execute(select(Strategy).where(Strategy.id == sid))
+                if existing.scalar_one_or_none() is None:
+                    log.info("Nueva estrategia detectada: %s — sembrando...", sid)
+                    session.add(Strategy(
+                        id=config.id, name=config.name,
+                        description=config.description, enabled=config.enabled,
+                        params={"signal_type": config.signal_type, "direction": config.direction,
+                                "instruments": list(config.instruments),
+                                "primary_timeframe": config.primary_timeframe,
+                                "context_timeframe": config.context_timeframe,
+                                "risk_per_trade_pct": config.risk_per_trade_pct,
+                                "min_risk_reward": config.min_risk_reward,
+                                "max_concurrent_positions": config.max_concurrent_positions,
+                                "cycle_interval_minutes": config.cycle_interval_minutes,
+                                "trades_per_improvement_cycle": config.trades_per_improvement_cycle},
+                        status_text="Activa — esperando señales",
+                        llm_budget_fraction=config.llm_budget_fraction,
+                    ))
+                    session.add(AgentState(
+                        strategy_id=config.id, mode="SIMULATION",
+                        capital_usd=config.initial_capital_usd,
+                        peak_capital_usd=config.initial_capital_usd,
+                    ))
+                    log.info("  Sembrada: %s", config.id)
             await session.commit()
 
     # Iniciar scheduler

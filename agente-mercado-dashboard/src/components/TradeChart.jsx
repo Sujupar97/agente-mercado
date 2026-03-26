@@ -41,8 +41,11 @@ export function TradeChart({ tradeId, onClose }) {
     if (!data || !chartContainerRef.current || !data.candles?.length) return;
 
     const container = chartContainerRef.current;
+    if (container.clientWidth === 0) return; // Container not yet laid out
 
-    const chart = createChart(container, {
+    let chart;
+    try {
+    chart = createChart(container, {
       layout: {
         background: { type: ColorType.Solid, color: '#0f1117' },
         textColor: '#9ca3af',
@@ -94,14 +97,20 @@ export function TradeChart({ tradeId, onClose }) {
       });
     }
 
-    // Markers (entry/exit arrows)
+    // Markers (entry/exit arrows) — binary search for nearest candle
     if (data.markers?.length) {
-      // Snap markers to nearest candle time
       const candleTimes = data.candles.map(c => c.time);
       const snappedMarkers = data.markers.map(m => {
-        const nearest = candleTimes.reduce((prev, curr) =>
-          Math.abs(curr - m.time) < Math.abs(prev - m.time) ? curr : prev
-        );
+        let lo = 0, hi = candleTimes.length - 1;
+        while (lo < hi) {
+          const mid = (lo + hi) >> 1;
+          if (candleTimes[mid] < m.time) lo = mid + 1;
+          else hi = mid;
+        }
+        // Check lo and lo-1 for nearest
+        const nearest = lo > 0 && Math.abs(candleTimes[lo - 1] - m.time) < Math.abs(candleTimes[lo] - m.time)
+          ? candleTimes[lo - 1]
+          : candleTimes[lo];
         return { ...m, time: nearest };
       }).sort((a, b) => a.time - b.time);
 
@@ -113,7 +122,7 @@ export function TradeChart({ tradeId, onClose }) {
 
     // Resize handler
     const handleResize = () => {
-      if (chartContainerRef.current) {
+      if (chartContainerRef.current && chart) {
         chart.applyOptions({ width: chartContainerRef.current.clientWidth });
       }
     };
@@ -121,9 +130,15 @@ export function TradeChart({ tradeId, onClose }) {
 
     return () => {
       window.removeEventListener('resize', handleResize);
-      chart.remove();
+      if (chart) {
+        chart.remove();
+      }
       chartRef.current = null;
     };
+    } catch (err) {
+      console.error('Error rendering chart:', err);
+      setError('Error renderizando el gráfico');
+    }
   }, [data]);
 
   const pnlColor = data?.pnl > 0 ? 'text-emerald-400' : data?.pnl < 0 ? 'text-red-400' : 'text-gray-400';

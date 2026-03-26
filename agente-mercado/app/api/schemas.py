@@ -247,6 +247,7 @@ class StrategyOut(BaseModel):
     win_rate: float
     mode: str
     last_trade_at: datetime | None
+    broker_balance: float | None = None
     base_capital_usd: float | None = None
     next_threshold_usd: float | None = None
     risk_per_trade_usd: float | None = None

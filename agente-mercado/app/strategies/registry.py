@@ -1,6 +1,7 @@
-"""Registry de estrategias — Oliver Vélez Forex: S1 y S2.
+"""Registry de estrategias — Oliver Vélez (S1/S2) + SMC El Sensei (S3).
 
-Dos estrategias de pullback a EMA20 según el Plan de Trading.
+S1/S2: Pullback a EMA20 según el Plan de Trading de Oliver Vélez.
+S3: Smart Money Concepts (Order Blocks, BOS/ChoCH, Liquidity Sweeps).
 Las señales se generan por reglas técnicas, NO por LLM.
 """
 
@@ -24,8 +25,8 @@ class StrategyConfig:
     description: str
 
     # Dirección y tipo
-    signal_type: str  # "pullback_ema20_long" | "pullback_ema20_short"
-    direction: str  # "LONG" | "SHORT"
+    signal_type: str  # "pullback_ema20_long" | "pullback_ema20_short" | "smc_institutional"
+    direction: str  # "LONG" | "SHORT" | "BOTH"
 
     # Instrumentos que opera
     instruments: tuple[str, ...] = ("EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD")
@@ -39,10 +40,11 @@ class StrategyConfig:
     entry_min_retrace_pct: float = 0.20  # 20% retrace (más bajo que H1)
     entry_ema20_zone_atr_mult: float = 0.50  # 0.50 ATR zone (más ancho que H1)
 
-    # Risk (Oliver Vélez)
+    # Risk
     risk_per_trade_pct: float = 0.01  # 1% del balance
     min_risk_reward: float = 2.0  # R:R mínimo 1:2
     max_concurrent_positions: int = 3
+    max_trades_per_day: int = 0  # 0 = sin límite, >0 = máximo trades por día
 
     # Timing
     cycle_interval_minutes: int = 15  # Alineado a velas H1
@@ -88,5 +90,21 @@ STRATEGIES: dict[str, StrategyConfig] = {
         ),
         signal_type="pullback_ema20_short",
         direction="SHORT",
+    ),
+    "s3_smc_sensei": StrategyConfig(
+        id="s3_smc_sensei",
+        name="S3 — SMC El Sensei",
+        description=(
+            "Smart Money Concepts: Order Blocks + BOS/ChoCH + Liquidity Sweeps. "
+            "Metodología institucional inspirada en El Sensei. BIAS multi-timeframe "
+            "(D1 > H4 > H1), entradas en M5 con OB + confirmación de estructura. "
+            "Máximo 1 trade por día. R:R mínimo 1:2."
+        ),
+        signal_type="smc_institutional",
+        direction="BOTH",
+        instruments=("EUR_USD", "GBP_USD", "USD_JPY"),
+        entry_timeframe="M5",
+        max_concurrent_positions=1,
+        max_trades_per_day=1,
     ),
 }

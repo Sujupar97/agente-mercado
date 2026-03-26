@@ -1,9 +1,9 @@
-"""Orquestador Forex — monitorea 4 pares fijos, ejecuta S1/S2.
+"""Orquestador Forex — monitorea pares, ejecuta S1/S2 (Oliver Vélez) + S3 (SMC).
 
 Flujo:
 1. Verificar sesión de trading (Londres/NY)
 2. Verificar que mercado Forex está abierto
-3. Para cada instrumento: fetch candles H1+H4 desde OANDA
+3. Para cada instrumento: fetch candles H1+H4+D1 desde broker
 4. Para cada estrategia habilitada: generar señales, calcular position size, ejecutar
 5. Gestionar posiciones abiertas (break-even, parciales, trailing)
 """
@@ -33,13 +33,14 @@ from app.signals.rule_engine import (
     ForexSignalGenerator,
     ImprovementRuleCheck,
 )
+from app.signals.smc.signal_engine import SMCSignalGenerator
 from app.strategies.registry import STRATEGIES
 
 log = logging.getLogger(__name__)
 
 
 class ForexOrchestrator:
-    """Orquesta las estrategias S1/S2 sobre pares Forex fijos vía OANDA."""
+    """Orquesta las estrategias S1/S2 (Oliver Vélez) + S3 (SMC) vía broker."""
 
     # Máximo tiempo (seg) antes de forzar refresco de contexto
     _CONTEXT_MAX_AGE_SEC = 60 * 60  # 1 hora
@@ -51,10 +52,19 @@ class ForexOrchestrator:
         self._instruments = settings.instruments_list
         self._cycle_count = 0
 
-        # Cache de contexto H1/H4 por estrategia
+        # Cache de contexto H1/H4 por estrategia (S1/S2)
         # {strategy_id: {instrument: ContextResult}}
         self._context_cache: dict[str, dict[str, ContextResult]] = {}
         self._context_updated_at: datetime | None = None
+
+        # Cache de BIAS SMC por instrumento (S3)
+        # {instrument: "BULLISH"|"BEARISH"|"NEUTRAL"}
+        self._smc_bias_cache: dict[str, str] = {}
+        self._smc_bias_updated_at: datetime | None = None
+
+        # Trades hoy por estrategia (para max_trades_per_day)
+        self._trades_today: dict[str, int] = {}
+        self._trades_today_date: str = ""
 
     # ── Ciclo legacy (wrapper) ─────────────────────────────────
 
@@ -96,6 +106,12 @@ class ForexOrchestrator:
                     if not config.enabled:
                         continue
 
+                    if config.signal_type == "smc_institutional":
+                        # S3 SMC: calcular BIAS multi-timeframe
+                        await self._run_smc_context(config, instruments_data)
+                        continue
+
+                    # S1/S2: 8 filtros de contexto Oliver Vélez
                     improvement_rules = await self._load_improvement_rules(
                         session, strategy_id,
                     )
@@ -155,28 +171,35 @@ class ForexOrchestrator:
                     if not config.enabled:
                         continue
 
-                    context = self._context_cache.get(strategy_id, {})
-                    if not context:
+                    # Check daily trade limit
+                    if self._check_daily_trade_limit(strategy_id, config):
                         continue
 
-                    # Fetch candles de entrada solo para instrumentos listos
-                    ready_instruments = list(context.keys())
-                    entry_data = await self._fetch_entry_candles(ready_instruments, config.entry_timeframe)
+                    if config.signal_type == "smc_institutional":
+                        # S3 SMC: usar BIAS cache + M5 entries
+                        signals = await self._run_smc_entries(session, config)
+                    else:
+                        # S1/S2: usar context cache + M1 entries
+                        context = self._context_cache.get(strategy_id, {})
+                        if not context:
+                            continue
 
-                    if not entry_data:
-                        continue
+                        ready_instruments = list(context.keys())
+                        entry_data = await self._fetch_entry_candles(ready_instruments, config.entry_timeframe)
+                        if not entry_data:
+                            continue
 
-                    # Generar señales
-                    improvement_rules = await self._load_improvement_rules(
-                        session, strategy_id,
-                    )
-                    generator = ForexSignalGenerator(config, improvement_rules)
-                    signals = generator.scan_entries(context, entry_data)
+                        improvement_rules = await self._load_improvement_rules(
+                            session, strategy_id,
+                        )
+                        generator = ForexSignalGenerator(config, improvement_rules)
+                        signals = generator.scan_entries(context, entry_data)
 
                     for signal in signals:
                         traded = await self._execute_signal(session, signal, strategy_id)
                         if traded:
                             total_trades += 1
+                            self._record_daily_trade(strategy_id)
 
                     # Check learning
                     improvement_engine = ImprovementEngine(session)
@@ -209,8 +232,14 @@ class ForexOrchestrator:
         return age > self._CONTEXT_MAX_AGE_SEC
 
     async def _fetch_all_candles(self) -> dict[str, dict[str, list[Candle]]]:
-        """Fetch candles H1 y H4 para todos los instrumentos (contexto)."""
+        """Fetch candles H1, H4 y D1 para todos los instrumentos (contexto)."""
         result: dict[str, dict[str, list[Candle]]] = {}
+
+        # Check if any strategy needs D1 candles
+        needs_d1 = any(
+            c.signal_type == "smc_institutional" and c.enabled
+            for c in STRATEGIES.values()
+        )
 
         for instrument in self._instruments:
             try:
@@ -222,10 +251,98 @@ class ForexOrchestrator:
                         "H1": candles_h1,
                         "H4": candles_h4,
                     }
+
+                    # Fetch D1 for SMC strategies
+                    if needs_d1:
+                        try:
+                            candles_d1 = await self._broker.get_candles(instrument, "D1", 100)
+                            result[instrument]["D1"] = candles_d1
+                        except Exception:
+                            log.debug("D1 candles no disponibles para %s", instrument)
             except Exception:
                 log.exception("Error fetching candles para %s", instrument)
 
         return result
+
+    async def _run_smc_context(
+        self,
+        config: "StrategyConfig",
+        instruments_data: dict[str, dict[str, list[Candle]]],
+    ) -> None:
+        """Fase 1 SMC: calcular BIAS multi-timeframe para S3."""
+        # Filter to only this strategy's instruments
+        smc_data = {
+            inst: tf_data for inst, tf_data in instruments_data.items()
+            if inst in config.instruments
+        }
+        if not smc_data:
+            return
+
+        improvement_rules = []  # SMC doesn't use improvement rules yet in context
+        generator = SMCSignalGenerator(config, improvement_rules)
+        bias_results = generator.check_bias(smc_data)
+
+        self._smc_bias_cache = bias_results
+        self._smc_bias_updated_at = datetime.now(timezone.utc)
+
+        ready = [inst for inst, bias in bias_results.items() if bias != "NEUTRAL"]
+        log.info(
+            "[%s] BIAS: %d/%d instrumentos con dirección%s",
+            config.id, len(ready), len(smc_data),
+            f" ({', '.join(f'{i}={bias_results[i]}' for i in ready)})" if ready else "",
+        )
+
+    async def _run_smc_entries(
+        self, session: AsyncSession, config: "StrategyConfig",
+    ) -> list[ForexSignal]:
+        """Fase 2 SMC: buscar entradas en M5 para instrumentos con BIAS."""
+        # Filter instruments with active BIAS
+        ready_instruments = [
+            inst for inst in config.instruments
+            if self._smc_bias_cache.get(inst, "NEUTRAL") != "NEUTRAL"
+        ]
+        if not ready_instruments:
+            return []
+
+        # Fetch M5 candles
+        entry_data = await self._fetch_entry_candles(ready_instruments, config.entry_timeframe)
+        if not entry_data:
+            return []
+
+        # Also fetch H1 for MarketState in signals
+        h1_data: dict[str, list[Candle]] = {}
+        for inst in ready_instruments:
+            try:
+                candles_h1 = await self._broker.get_candles(inst, "H1", 250)
+                if candles_h1:
+                    h1_data[inst] = candles_h1
+            except Exception:
+                pass
+
+        improvement_rules = await self._load_improvement_rules(session, config.id)
+        generator = SMCSignalGenerator(config, improvement_rules)
+        return generator.scan_entries(self._smc_bias_cache, entry_data, h1_data)
+
+    def _check_daily_trade_limit(self, strategy_id: str, config) -> bool:
+        """Verifica si la estrategia ya alcanzó su límite diario de trades."""
+        if config.max_trades_per_day <= 0:
+            return False  # Sin límite
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if self._trades_today_date != today:
+            self._trades_today = {}
+            self._trades_today_date = today
+
+        count = self._trades_today.get(strategy_id, 0)
+        return count >= config.max_trades_per_day
+
+    def _record_daily_trade(self, strategy_id: str) -> None:
+        """Registra un trade ejecutado hoy para el límite diario."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if self._trades_today_date != today:
+            self._trades_today = {}
+            self._trades_today_date = today
+        self._trades_today[strategy_id] = self._trades_today.get(strategy_id, 0) + 1
 
     async def _fetch_entry_candles(
         self, instruments: list[str], entry_timeframe: str = "M1",
@@ -651,6 +768,21 @@ class ForexOrchestrator:
             trade.exit_reason = "SL"
         else:
             trade.exit_reason = "BROKER"
+
+        # Actualizar Bitacora correspondiente (exit data + pnl)
+        result_bitacora = await session.execute(
+            select(Bitacora).where(Bitacora.trade_id == trade.id)
+        )
+        bitacora_entry = result_bitacora.scalar_one_or_none()
+        if bitacora_entry:
+            bitacora_entry.exit_reason = trade.exit_reason
+            bitacora_entry.exit_price = exit_price
+            bitacora_entry.exit_time = datetime.now(timezone.utc)
+            bitacora_entry.pnl = trade.pnl
+            if trade.created_at:
+                bitacora_entry.hold_duration_minutes = (
+                    (datetime.now(timezone.utc) - trade.created_at).total_seconds() / 60
+                )
 
         # Actualizar AgentState
         state = await self._ensure_state(session, trade.strategy_id)
