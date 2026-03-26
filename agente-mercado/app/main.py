@@ -54,57 +54,43 @@ async def lifespan(app: FastAPI):
                 await conn.execute(text(sql))
             except Exception:
                 pass  # Columna ya existe o DB no soporta IF NOT EXISTS
-    log.info("Tablas verificadas/creadas")
 
-    # Post-migration: Bitácora retroactiva + seeding de estrategias nuevas
-    try:
-        async with engine.begin() as post_conn:
-            from sqlalchemy import text as txt
+        # Bitácora retroactiva (mismo conn)
+        try:
+            r = await conn.execute(text("""
+                UPDATE bitacora SET
+                    exit_reason = t.exit_reason, exit_price = t.exit_price,
+                    exit_time = t.closed_at, pnl = t.pnl,
+                    hold_duration_minutes = EXTRACT(EPOCH FROM (t.closed_at - bitacora.entry_time)) / 60
+                FROM trades t
+                WHERE bitacora.trade_id = t.id AND t.status = 'CLOSED' AND bitacora.pnl IS NULL
+            """))
+            if r.rowcount > 0:
+                log.info("Bitácora: %d entries actualizadas", r.rowcount)
+        except Exception:
+            log.exception("Error Bitácora migration")
 
-            # 1. Llenar bitácoras existentes con datos de trades cerrados
+        # Sembrar estrategias nuevas (mismo conn)
+        for sid, config in STRATEGIES.items():
             try:
-                r = await post_conn.execute(txt("""
-                    UPDATE bitacora SET
-                        exit_reason = t.exit_reason,
-                        exit_price = t.exit_price,
-                        exit_time = t.closed_at,
-                        pnl = t.pnl,
-                        hold_duration_minutes = EXTRACT(EPOCH FROM (t.closed_at - bitacora.entry_time)) / 60
-                    FROM trades t
-                    WHERE bitacora.trade_id = t.id
-                        AND t.status = 'CLOSED'
-                        AND bitacora.pnl IS NULL
-                """))
-                if r.rowcount > 0:
-                    log.info("Bitácora: %d entries actualizadas retroactivamente", r.rowcount)
+                r = await conn.execute(text("SELECT id FROM strategies WHERE id = :sid"), {"sid": sid})
+                if r.first() is None:
+                    log.info("Sembrando estrategia: %s", sid)
+                    await conn.execute(text(
+                        "INSERT INTO strategies (id, name, description, enabled, params, status_text, llm_budget_fraction) "
+                        "VALUES (:id, :name, :desc, true, :params, :status, :budget)"
+                    ), {"id": sid, "name": config.name, "desc": config.description,
+                        "params": '{"signal_type": "' + config.signal_type + '"}',
+                        "status": "Activa — esperando señales", "budget": config.llm_budget_fraction})
+                    await conn.execute(text(
+                        "INSERT INTO agent_state (strategy_id, mode, capital_usd, peak_capital_usd) "
+                        "VALUES (:sid, 'SIMULATION', :cap, :cap)"
+                    ), {"sid": sid, "cap": config.initial_capital_usd})
+                    log.info("  OK: %s", sid)
             except Exception:
-                log.exception("Error en migración Bitácora")
+                log.exception("Error sembrando %s", sid)
 
-            # 2. Sembrar estrategias nuevas
-            log.info("Verificando %d estrategias...", len(STRATEGIES))
-            for sid, config in STRATEGIES.items():
-                try:
-                    r = await post_conn.execute(
-                        txt("SELECT id FROM strategies WHERE id = :sid"), {"sid": sid},
-                    )
-                    if r.first() is None:
-                        log.info("Sembrando: %s", sid)
-                        await post_conn.execute(
-                            txt("INSERT INTO strategies (id, name, description, enabled, params, status_text, llm_budget_fraction) VALUES (:id, :name, :desc, true, :params, :status, :budget)"),
-                            {"id": sid, "name": config.name, "desc": config.description,
-                             "params": '{"signal_type": "' + config.signal_type + '"}',
-                             "status": "Activa — esperando señales",
-                             "budget": config.llm_budget_fraction},
-                        )
-                        await post_conn.execute(
-                            txt("INSERT INTO agent_state (strategy_id, mode, capital_usd, peak_capital_usd) VALUES (:sid, 'SIMULATION', :cap, :cap)"),
-                            {"sid": sid, "cap": config.initial_capital_usd},
-                        )
-                        log.info("  Sembrada: %s", sid)
-                except Exception:
-                    log.exception("Error sembrando %s", sid)
-    except Exception:
-        log.exception("Error en post-migration")
+    log.info("Tablas verificadas/creadas")
 
     # Legacy seeding (DB vacía — primera ejecución)
     async with async_session_factory() as session:
