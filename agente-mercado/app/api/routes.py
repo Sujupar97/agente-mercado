@@ -1546,6 +1546,24 @@ async def get_trade_chart_data(
             )
         )
 
+    # Fetch bitacora entry for reasoning
+    entry_reasoning = None
+    exit_reason_text = trade.exit_reason
+    market_context = trade.market_state_json
+    try:
+        bitacora_result = await session.execute(
+            select(Bitacora).where(Bitacora.trade_id == trade.id)
+        )
+        bitacora_entry = bitacora_result.scalar_one_or_none()
+        if bitacora_entry:
+            entry_reasoning = bitacora_entry.entry_reasoning
+            if bitacora_entry.exit_reason:
+                exit_reason_text = bitacora_entry.exit_reason
+            if bitacora_entry.market_context:
+                market_context = bitacora_entry.market_context
+    except Exception:
+        pass
+
     return TradeChartDataOut(
         trade_id=trade.id,
         symbol=trade.symbol,
@@ -1560,6 +1578,10 @@ async def get_trade_chart_data(
         pattern_name=trade.pattern_name,
         entry_time=entry_dt.isoformat() if entry_dt else None,
         exit_time=trade.closed_at.isoformat() if trade.closed_at else None,
+        risk_reward=trade.risk_reward_ratio,
+        entry_reasoning=entry_reasoning,
+        exit_reason=exit_reason_text,
+        market_context=market_context,
         candles=candles,
         markers=markers,
         price_lines=price_lines,

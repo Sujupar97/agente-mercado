@@ -452,6 +452,10 @@ class TradeChartDataOut(BaseModel):
     pattern_name: str | None
     entry_time: str | None
     exit_time: str | None
+    risk_reward: float | None = None
+    entry_reasoning: str | None = None
+    exit_reason: str | None = None
+    market_context: dict | None = None
     candles: list[ChartCandleOut]
     markers: list[TradeMarkerOut]
     price_lines: list[TradePriceLine]

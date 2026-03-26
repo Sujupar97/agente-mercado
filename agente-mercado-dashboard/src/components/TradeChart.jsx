@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { createChart, ColorType, LineStyle, CandlestickSeries } from 'lightweight-charts';
+import { createChart, ColorType, LineStyle, CandlestickSeries, createSeriesMarkers } from 'lightweight-charts';
 import { api } from '../api/endpoints';
 import { XMarkIcon } from '@heroicons/react/24/outline';
 
@@ -41,100 +41,102 @@ export function TradeChart({ tradeId, onClose }) {
     if (!data || !chartContainerRef.current || !data.candles?.length) return;
 
     const container = chartContainerRef.current;
-    if (container.clientWidth === 0) return; // Container not yet laid out
+    if (container.clientWidth === 0) return;
 
     let chart;
+    let markersPlugin;
     try {
-    chart = createChart(container, {
-      layout: {
-        background: { type: ColorType.Solid, color: '#0f1117' },
-        textColor: '#9ca3af',
-        fontSize: 11,
-      },
-      grid: {
-        vertLines: { color: '#1f2937' },
-        horzLines: { color: '#1f2937' },
-      },
-      crosshair: {
-        mode: 0,
-      },
-      rightPriceScale: {
-        borderColor: '#374151',
-        scaleMargins: { top: 0.1, bottom: 0.1 },
-      },
-      timeScale: {
-        borderColor: '#374151',
-        timeVisible: true,
-        secondsVisible: false,
-      },
-      width: container.clientWidth,
-      height: 400,
-    });
-
-    chartRef.current = chart;
-
-    // Candlestick series
-    const candleSeries = chart.addSeries(CandlestickSeries, {
-      upColor: '#22c55e',
-      downColor: '#ef4444',
-      borderDownColor: '#ef4444',
-      borderUpColor: '#22c55e',
-      wickDownColor: '#ef4444',
-      wickUpColor: '#22c55e',
-    });
-
-    candleSeries.setData(data.candles);
-
-    // Price lines (entry, SL, TP, exit)
-    for (const line of data.price_lines) {
-      candleSeries.createPriceLine({
-        price: line.price,
-        color: line.color,
-        lineWidth: line.label === 'Entrada' ? 2 : 1,
-        lineStyle: LINE_STYLES[line.line_style] ?? LineStyle.Dashed,
-        axisLabelVisible: true,
-        title: line.label,
+      chart = createChart(container, {
+        layout: {
+          background: { type: ColorType.Solid, color: '#0f1117' },
+          textColor: '#9ca3af',
+          fontSize: 11,
+        },
+        grid: {
+          vertLines: { color: '#1f2937' },
+          horzLines: { color: '#1f2937' },
+        },
+        crosshair: { mode: 0 },
+        rightPriceScale: {
+          borderColor: '#374151',
+          scaleMargins: { top: 0.1, bottom: 0.1 },
+        },
+        timeScale: {
+          borderColor: '#374151',
+          timeVisible: true,
+          secondsVisible: false,
+        },
+        width: container.clientWidth,
+        height: 400,
       });
-    }
 
-    // Markers (entry/exit arrows) — binary search for nearest candle
-    if (data.markers?.length) {
-      const candleTimes = data.candles.map(c => c.time);
-      const snappedMarkers = data.markers.map(m => {
-        let lo = 0, hi = candleTimes.length - 1;
-        while (lo < hi) {
-          const mid = (lo + hi) >> 1;
-          if (candleTimes[mid] < m.time) lo = mid + 1;
-          else hi = mid;
+      chartRef.current = chart;
+
+      // Candlestick series
+      const candleSeries = chart.addSeries(CandlestickSeries, {
+        upColor: '#22c55e',
+        downColor: '#ef4444',
+        borderDownColor: '#ef4444',
+        borderUpColor: '#22c55e',
+        wickDownColor: '#ef4444',
+        wickUpColor: '#22c55e',
+      });
+
+      candleSeries.setData(data.candles);
+
+      // Price lines (entry, SL, TP, exit)
+      for (const line of data.price_lines) {
+        candleSeries.createPriceLine({
+          price: line.price,
+          color: line.color,
+          lineWidth: line.label === 'Entrada' ? 2 : 1,
+          lineStyle: LINE_STYLES[line.line_style] ?? LineStyle.Dashed,
+          axisLabelVisible: true,
+          title: line.label,
+        });
+      }
+
+      // Markers (entry/exit arrows) — v5 API: createSeriesMarkers
+      if (data.markers?.length) {
+        const candleTimes = data.candles.map(c => c.time);
+        const snappedMarkers = data.markers.map(m => {
+          let lo = 0, hi = candleTimes.length - 1;
+          while (lo < hi) {
+            const mid = (lo + hi) >> 1;
+            if (candleTimes[mid] < m.time) lo = mid + 1;
+            else hi = mid;
+          }
+          const nearest = lo > 0 && Math.abs(candleTimes[lo - 1] - m.time) < Math.abs(candleTimes[lo] - m.time)
+            ? candleTimes[lo - 1]
+            : candleTimes[lo];
+          return { ...m, time: nearest };
+        }).sort((a, b) => a.time - b.time);
+
+        try {
+          markersPlugin = createSeriesMarkers(candleSeries, snappedMarkers);
+        } catch {
+          // Fallback: markers not supported in this version
+          console.warn('Markers not available');
         }
-        // Check lo and lo-1 for nearest
-        const nearest = lo > 0 && Math.abs(candleTimes[lo - 1] - m.time) < Math.abs(candleTimes[lo] - m.time)
-          ? candleTimes[lo - 1]
-          : candleTimes[lo];
-        return { ...m, time: nearest };
-      }).sort((a, b) => a.time - b.time);
-
-      candleSeries.setMarkers(snappedMarkers);
-    }
-
-    // Fit content
-    chart.timeScale().fitContent();
-
-    // Resize handler
-    const handleResize = () => {
-      if (chartContainerRef.current && chart) {
-        chart.applyOptions({ width: chartContainerRef.current.clientWidth });
       }
-    };
-    window.addEventListener('resize', handleResize);
 
-    return () => {
-      window.removeEventListener('resize', handleResize);
-      if (chart) {
-        chart.remove();
-      }
-      chartRef.current = null;
-    };
+      chart.timeScale().fitContent();
+
+      const handleResize = () => {
+        if (chartContainerRef.current && chart) {
+          chart.applyOptions({ width: chartContainerRef.current.clientWidth });
+        }
+      };
+      window.addEventListener('resize', handleResize);
+
+      return () => {
+        window.removeEventListener('resize', handleResize);
+        if (markersPlugin) {
+          try { markersPlugin.detach(); } catch {}
+        }
+        if (chart) chart.remove();
+        chartRef.current = null;
+      };
     } catch (err) {
       console.error('Error rendering chart:', err);
       setError('Error renderizando el gráfico');
@@ -146,7 +148,7 @@ export function TradeChart({ tradeId, onClose }) {
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
-      <div className="bg-gray-900 border border-gray-700/50 rounded-2xl w-full max-w-4xl overflow-hidden shadow-2xl">
+      <div className="bg-gray-900 border border-gray-700/50 rounded-2xl w-full max-w-4xl max-h-[90vh] overflow-y-auto shadow-2xl">
         {/* Header */}
         <div className="flex items-center justify-between px-5 py-3 border-b border-gray-700/50">
           <div className="flex items-center space-x-3">
@@ -186,7 +188,7 @@ export function TradeChart({ tradeId, onClose }) {
 
         {/* Trade info bar */}
         {data && (
-          <div className="flex items-center space-x-6 px-5 py-2 bg-gray-800/30 text-xs">
+          <div className="flex flex-wrap items-center gap-x-5 gap-y-1 px-5 py-2 bg-gray-800/30 text-xs">
             <div>
               <span className="text-gray-500">Entrada: </span>
               <span className="text-blue-400 font-medium">{data.entry_price.toFixed(decimals)}</span>
@@ -229,6 +231,12 @@ export function TradeChart({ tradeId, onClose }) {
                 </span>
               </div>
             )}
+            {data.risk_reward && (
+              <div>
+                <span className="text-gray-500">R:R </span>
+                <span className="text-gray-300 font-medium">1:{data.risk_reward.toFixed(1)}</span>
+              </div>
+            )}
             <div>
               <span className={`px-1.5 py-0.5 rounded ${
                 data.status === 'OPEN'
@@ -250,7 +258,7 @@ export function TradeChart({ tradeId, onClose }) {
               <div className="w-8 h-8 border-2 border-blue-500/30 border-t-blue-500 rounded-full animate-spin" />
             </div>
           )}
-          {error && (
+          {error && !data?.candles?.length && (
             <div className="flex items-center justify-center h-[400px]">
               <p className="text-red-400 text-sm">{error}</p>
             </div>
@@ -262,6 +270,45 @@ export function TradeChart({ tradeId, onClose }) {
           )}
           <div ref={chartContainerRef} />
         </div>
+
+        {/* Trade Reasoning */}
+        {data && (data.entry_reasoning || data.exit_reason) && (
+          <div className="px-5 py-3 border-t border-gray-700/30 space-y-2">
+            {data.entry_reasoning && (
+              <div className="bg-gray-800/50 rounded-lg p-3">
+                <p className="text-xs text-blue-400 font-medium mb-1">Razonamiento de Entrada</p>
+                <p className="text-xs text-gray-300">{data.entry_reasoning}</p>
+              </div>
+            )}
+            {data.exit_reason && (
+              <div className="bg-gray-800/50 rounded-lg p-3">
+                <p className="text-xs text-amber-400 font-medium mb-1">Razón de Salida</p>
+                <p className="text-xs text-gray-300">
+                  {data.exit_reason === 'TP' ? 'Take Profit alcanzado' :
+                   data.exit_reason === 'SL' ? 'Stop Loss activado' :
+                   data.exit_reason === 'BROKER' ? 'Cerrado por el broker' :
+                   data.exit_reason}
+                </p>
+              </div>
+            )}
+            {data.market_context && (
+              <div className="bg-gray-800/50 rounded-lg p-3">
+                <p className="text-xs text-purple-400 font-medium mb-1">Contexto de Mercado</p>
+                <div className="grid grid-cols-3 gap-2 text-xs text-gray-400">
+                  {data.market_context.trend_state && (
+                    <span>Tendencia: <span className="text-white">{data.market_context.trend_state}</span></span>
+                  )}
+                  {data.market_context.ma_state && (
+                    <span>MAs: <span className="text-white">{data.market_context.ma_state}</span></span>
+                  )}
+                  {data.market_context.ema20_slope && (
+                    <span>EMA20: <span className="text-white">{data.market_context.ema20_slope}</span></span>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Legend */}
         <div className="flex items-center justify-center space-x-6 px-5 py-2 border-t border-gray-700/30 text-xs">
