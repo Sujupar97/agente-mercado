@@ -1657,3 +1657,4 @@ async def reset_simulation(session: AsyncSession = Depends(get_session)):
     await session.commit()
 
     return {"status": "ok", "message": f"Reseteado con balance real del broker: ${balance:.2f}"}
+
