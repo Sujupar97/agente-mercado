@@ -10,6 +10,7 @@ Flujo:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 
@@ -171,6 +172,18 @@ class ForexOrchestrator:
                 # Gestionar posiciones abiertas
                 await self._manage_positions(session)
 
+                # Pre-fetch candles por timeframe (compartidos entre estrategias)
+                all_instruments = list(set(
+                    inst for config in STRATEGIES.values()
+                    if config.enabled for inst in config.instruments
+                ))
+                candle_cache: dict[str, dict[str, list[Candle]]] = {}
+                for tf in ("M1", "M5", "H1", "H4"):
+                    needed = [i for i in all_instruments
+                              if any(c.entry_timeframe == tf and c.enabled for c in STRATEGIES.values())]
+                    if needed:
+                        candle_cache[tf] = await self._fetch_entry_candles(needed, tf)
+
                 # Buscar entradas para cada estrategia
                 total_trades = 0
                 for strategy_id, config in STRATEGIES.items():
@@ -181,34 +194,54 @@ class ForexOrchestrator:
                     if self._check_daily_trade_limit(strategy_id, config):
                         continue
 
-                    if config.signal_type == "smc_institutional":
-                        # S3 SMC: usar BIAS cache + M5 entries
-                        signals = await self._run_smc_entries(session, config)
+                    try:
+                        if config.signal_type == "smc_institutional":
+                            entry_data = candle_cache.get(config.entry_timeframe, {})
+                            h1_data = candle_cache.get("H1", {})
+                            improvement_rules = await self._load_improvement_rules(session, config.id)
+                            generator = SMCSignalGenerator(config, improvement_rules)
+                            signals = generator.scan_entries(self._smc_bias_cache, entry_data, h1_data)
 
-                    elif config.signal_type == "turtle_breakout":
-                        # S4 Turtle: breakout Donchian en H4
-                        signals = await self._run_turtle_entries(session, config)
+                        elif config.signal_type == "turtle_breakout":
+                            entry_data = candle_cache.get(config.entry_timeframe, {})
+                            if entry_data:
+                                last_results = getattr(self, "_turtle_last_breakout", {})
+                                improvement_rules = await self._load_improvement_rules(session, config.id)
+                                gen = TurtleSignalGenerator(config, improvement_rules, last_results)
+                                signals = gen.scan_entries(entry_data)
+                            else:
+                                signals = []
 
-                    elif config.signal_type == "connors_rsi2":
-                        # S5 Connors: RSI(2) mean reversion en H1
-                        signals = await self._run_connors_entries(session, config)
+                        elif config.signal_type == "connors_rsi2":
+                            entry_data = candle_cache.get(config.entry_timeframe, {})
+                            if entry_data:
+                                improvement_rules = await self._load_improvement_rules(session, config.id)
+                                gen = ConnorsSignalGenerator(config, improvement_rules)
+                                signals = gen.scan_entries(entry_data)
+                            else:
+                                signals = []
 
-                    else:
-                        # S1/S2: usar context cache + M1 entries
-                        context = self._context_cache.get(strategy_id, {})
-                        if not context:
-                            continue
+                        else:
+                            # S1/S2: usar context cache + M1 entries
+                            context = self._context_cache.get(strategy_id, {})
+                            if not context:
+                                continue
 
-                        ready_instruments = list(context.keys())
-                        entry_data = await self._fetch_entry_candles(ready_instruments, config.entry_timeframe)
-                        if not entry_data:
-                            continue
+                            ready_instruments = list(context.keys())
+                            entry_data = {i: candle_cache.get(config.entry_timeframe, {}).get(i, [])
+                                          for i in ready_instruments
+                                          if candle_cache.get(config.entry_timeframe, {}).get(i)}
+                            if not entry_data:
+                                continue
 
-                        improvement_rules = await self._load_improvement_rules(
-                            session, strategy_id,
-                        )
-                        generator = ForexSignalGenerator(config, improvement_rules)
-                        signals = generator.scan_entries(context, entry_data)
+                            improvement_rules = await self._load_improvement_rules(
+                                session, strategy_id,
+                            )
+                            generator = ForexSignalGenerator(config, improvement_rules)
+                            signals = generator.scan_entries(context, entry_data)
+                    except Exception:
+                        log.exception("[%s] Error generando señales", strategy_id)
+                        signals = []
 
                     for signal in signals:
                         traded = await self._execute_signal(session, signal, strategy_id)
@@ -259,7 +292,9 @@ class ForexOrchestrator:
         for instrument in self._instruments:
             try:
                 candles_h1 = await self._broker.get_candles(instrument, "H1", 250)
+                await asyncio.sleep(0.3)  # Rate limit Capital.com
                 candles_h4 = await self._broker.get_candles(instrument, "H4", 250)
+                await asyncio.sleep(0.3)
 
                 if candles_h1:
                     result[instrument] = {
@@ -272,6 +307,7 @@ class ForexOrchestrator:
                         try:
                             candles_d1 = await self._broker.get_candles(instrument, "D1", 100)
                             result[instrument]["D1"] = candles_d1
+                            await asyncio.sleep(0.3)
                         except Exception:
                             log.debug("D1 candles no disponibles para %s", instrument)
             except Exception:
@@ -338,36 +374,6 @@ class ForexOrchestrator:
         generator = SMCSignalGenerator(config, improvement_rules)
         return generator.scan_entries(self._smc_bias_cache, entry_data, h1_data)
 
-    async def _run_turtle_entries(
-        self, session: AsyncSession, config: "StrategyConfig",
-    ) -> list[ForexSignal]:
-        """S4 Turtle: buscar breakouts Donchian(20) en H4."""
-        entry_data = await self._fetch_entry_candles(
-            list(config.instruments), config.entry_timeframe,
-        )
-        if not entry_data:
-            return []
-
-        # Track último breakout won/lost por instrumento
-        last_results = getattr(self, "_turtle_last_breakout", {})
-        improvement_rules = await self._load_improvement_rules(session, config.id)
-        generator = TurtleSignalGenerator(config, improvement_rules, last_results)
-        return generator.scan_entries(entry_data)
-
-    async def _run_connors_entries(
-        self, session: AsyncSession, config: "StrategyConfig",
-    ) -> list[ForexSignal]:
-        """S5 Connors: buscar RSI(2) extremos en H1."""
-        entry_data = await self._fetch_entry_candles(
-            list(config.instruments), config.entry_timeframe,
-        )
-        if not entry_data:
-            return []
-
-        improvement_rules = await self._load_improvement_rules(session, config.id)
-        generator = ConnorsSignalGenerator(config, improvement_rules)
-        return generator.scan_entries(entry_data)
-
     def _check_daily_trade_limit(self, strategy_id: str, config) -> bool:
         """Verifica si la estrategia ya alcanzó su límite diario de trades."""
         if config.max_trades_per_day <= 0:
@@ -400,6 +406,7 @@ class ForexOrchestrator:
                 candles = await self._broker.get_candles(instrument, entry_timeframe, 100)
                 if candles:
                     result[instrument] = candles
+                await asyncio.sleep(0.3)  # Rate limit Capital.com
             except Exception:
                 log.exception("Error fetching %s para %s", entry_timeframe, instrument)
 
