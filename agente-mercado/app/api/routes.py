@@ -1601,6 +1601,34 @@ async def sync_broker_balance(session: AsyncSession = Depends(get_session)):
     }
 
 
+@router.post("/admin/seed-strategies")
+async def seed_strategies(session: AsyncSession = Depends(get_session)):
+    """Siembra estrategias que existen en el registry pero no en la DB."""
+    from sqlalchemy import text
+    from app.strategies.registry import STRATEGIES
+
+    seeded = []
+    for sid, config in STRATEGIES.items():
+        result = await session.execute(
+            text("SELECT id FROM strategies WHERE id = :sid"), {"sid": sid}
+        )
+        if result.first() is None:
+            await session.execute(text(
+                "INSERT INTO strategies (id, name, description, enabled, params, status_text, llm_budget_fraction) "
+                "VALUES (:id, :name, :desc, true, :params, :status, :budget)"
+            ), {"id": sid, "name": config.name, "desc": config.description,
+                "params": '{"signal_type": "' + config.signal_type + '", "direction": "' + config.direction + '"}',
+                "status": "Activa — esperando señales", "budget": config.llm_budget_fraction})
+            await session.execute(text(
+                "INSERT INTO agent_state (strategy_id, mode, capital_usd, peak_capital_usd) "
+                "VALUES (:sid, 'SIMULATION', :cap, :cap)"
+            ), {"sid": sid, "cap": config.initial_capital_usd})
+            seeded.append(sid)
+
+    await session.commit()
+    return {"status": "ok", "seeded": seeded, "total_in_registry": len(STRATEGIES)}
+
+
 @router.post("/admin/reset-simulation")
 async def reset_simulation(session: AsyncSession = Depends(get_session)):
     """Resetea capital, trades y señales para reiniciar simulación limpia."""
