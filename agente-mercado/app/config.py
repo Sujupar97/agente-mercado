@@ -67,6 +67,10 @@ class Settings(BaseSettings):
     reddit_client_secret: str = Field(default="")
 
     # --- LLM ---
+    anthropic_api_key: str = Field(default="", description="Claude Vision validator API key")
+    anthropic_vision_model: str = Field(default="claude-sonnet-4-5", description="Modelo Claude con vision")
+    vision_validator_enabled: bool = Field(default=False, description="Activar validación visual de entradas")
+    vision_min_confidence: float = Field(default=0.5, description="Confidence mínimo para aprobar entrada")
     gemini_api_key: str = Field(default="")
     gemini_model: str = Field(default="gemini-3.1-pro-preview")
     gemini_fallback_model: str = Field(default="gemini-3.1-flash-lite-preview")

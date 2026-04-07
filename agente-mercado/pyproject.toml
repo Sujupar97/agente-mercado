@@ -27,6 +27,11 @@ dependencies = [
     # Data analysis
     "pandas>=2.2.0",
     "numpy>=2.1.0",
+    # Chart rendering for vision validator
+    "matplotlib>=3.9.0",
+    "mplfinance>=0.12.10b0",
+    # Vision LLM validator
+    "anthropic>=0.39.0",
 ]
 
 [project.optional-dependencies]

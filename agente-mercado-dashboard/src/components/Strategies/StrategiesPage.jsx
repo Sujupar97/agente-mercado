@@ -43,9 +43,10 @@ export function StrategiesPage() {
     }
   }
 
-  // Summary stats
+  // Summary stats — usar SIEMPRE broker_balance (compartido entre estrategias)
+  // Sin fallback a sum(capital_usd): si está en 0, indica problema de sync con Capital.com
   const brokerBalance = strategies.reduce((max, s) => Math.max(max, s.broker_balance || 0), 0);
-  const totalCapital = brokerBalance > 0 ? brokerBalance : strategies.reduce((sum, s) => sum + (s.capital_usd || 0), 0);
+  const totalCapital = brokerBalance;
   const totalPnl = strategies.reduce((sum, s) => sum + (s.total_pnl || 0), 0);
   const totalTrades = strategies.reduce(
     (sum, s) => sum + s.trades_won + s.trades_lost,

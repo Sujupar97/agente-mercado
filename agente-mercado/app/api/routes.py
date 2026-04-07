@@ -91,14 +91,14 @@ async def get_status(
     states_result = await session.execute(select(AgentState))
     all_states = states_result.scalars().all()
 
-    # Capital = broker balance real (es el mismo para ambas estrategias)
+    # Capital = broker balance real de Capital.com (compartido entre estrategias)
+    # Sin fallback a capital_usd: el balance debe venir del sync periódico cada 5 min.
+    # Si broker_balance es 0, indica problema de sync — el dashboard debe mostrarlo así.
     broker_bal = max(
         (s.broker_balance for s in all_states if s.broker_balance),
         default=0.0,
     )
-    total_capital = broker_bal if broker_bal > 0 else (
-        sum(s.capital_usd for s in all_states) if all_states else 0.0
-    )
+    total_capital = broker_bal
     total_peak = max(
         (s.peak_capital_usd for s in all_states if s.peak_capital_usd),
         default=0.0,
@@ -1062,7 +1062,7 @@ async def get_broker_positions(
         positions = await broker.get_positions()
         result = []
         for p in positions:
-            # Obtener precio actual para calcular P&L no realizado
+            # Obtener precio actual solo para mostrar el precio (no para calcular PnL)
             try:
                 price = await broker.get_price(p.instrument)
                 current = price.mid
@@ -1070,7 +1070,11 @@ async def get_broker_positions(
                 current = p.entry_price
 
             direction = "BUY" if p.units > 0 else "SELL"
-            pnl = (current - p.entry_price) * p.units
+            # USAR EL VALOR DE CAPITAL.COM DIRECTAMENTE.
+            # Capital.com ya hace todas las conversiones (lots, JPY, gold contract size).
+            # Calcular manualmente con (current - entry) * units es BUG: ignora multiplicadores
+            # de contrato y produce valores 100-1000x incorrectos.
+            pnl = p.unrealized_pnl
 
             result.append(BrokerPositionOut(
                 trade_id=p.trade_id,

@@ -116,6 +116,17 @@ async def _run_position_sync():
         log.exception("Error en sincronización de posiciones")
 
 
+async def _run_broker_balance_sync():
+    """Sincroniza el balance/equity del broker cada 5 min."""
+    orch = _ensure_orchestrator()
+    if orch is None:
+        return
+    try:
+        await orch.sync_broker_account()
+    except Exception:
+        log.exception("Error en sync de broker balance")
+
+
 async def start_scheduler() -> None:
     global _scheduler
     _scheduler = AsyncIOScheduler()
@@ -150,9 +161,20 @@ async def start_scheduler() -> None:
         max_instances=1,
     )
 
+    # Job 4: Sync de balance broker — cada 5 min
+    _scheduler.add_job(
+        _run_broker_balance_sync,
+        trigger=IntervalTrigger(minutes=5),
+        id="broker_balance_sync",
+        name="Sync balance broker (cada 5 min)",
+        replace_existing=True,
+        max_instances=1,
+    )
+
     _scheduler.start()
     log.info(
-        "Scheduler Forex iniciado: broker=%s | contexto=15min | entradas=1min | sync=30seg",
+        "Scheduler Forex iniciado: broker=%s | contexto=15min | entradas=1min | "
+        "pos_sync=30seg | balance_sync=5min",
         settings.broker_provider,
     )
 

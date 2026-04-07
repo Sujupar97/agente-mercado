@@ -28,6 +28,8 @@ from app.learning.bitacora_engine import BitacoraEngine
 from app.learning.improvement_engine import ImprovementEngine
 from app.llm.gemini import GeminiClient
 from app.notifications.telegram import TelegramNotifier
+from app.services.economic_calendar import EconomicCalendarService
+from app.services.vision_validator import VisionValidator
 from app.signals.rule_engine import (
     ContextResult,
     ForexSignal,
@@ -73,12 +75,55 @@ class ForexOrchestrator:
         self._entry_candle_cache: dict[str, dict[str, list[Candle]]] = {}
         self._entry_candle_cache_at: datetime | None = None
 
+        # Servicio de calendario económico para protección de noticias
+        self._economic_calendar = EconomicCalendarService()
+
+        # Validador visual de entradas (opcional, controlado por settings)
+        self._vision_validator = VisionValidator()
+
     # ── Ciclo legacy (wrapper) ─────────────────────────────────
 
     async def run_cycle(self) -> None:
         """Ciclo completo legacy: contexto + entradas + posiciones."""
         await self.run_context_cycle()
         await self.run_entry_cycle()
+
+    # ── Sync de balance broker (cada 5 min) ────────────────────
+
+    async def sync_broker_account(self) -> None:
+        """Sincroniza broker balance/equity con Capital.com.
+
+        Antes solo se actualizaba al ejecutar trades, dejando el dashboard
+        desactualizado por horas. Ahora corre cada 5 min independiente de
+        si hay trades.
+        """
+        try:
+            account = await self._broker.get_account()
+        except Exception:
+            log.exception("Error obteniendo cuenta para sync de balance")
+            return
+
+        try:
+            async with async_session_factory() as session:
+                states = await session.execute(select(AgentState))
+                all_states = list(states.scalars().all())
+                if not all_states:
+                    log.debug("No hay AgentState para sincronizar")
+                    return
+
+                equity = account.balance + account.unrealized_pnl
+                for state in all_states:
+                    state.broker_balance = account.balance
+                    state.broker_equity = equity
+                    state.last_broker_sync_at = datetime.now(timezone.utc)
+                await session.commit()
+
+            log.info(
+                "Broker sync: balance=$%.2f equity=$%.2f upl=$%.2f",
+                account.balance, equity, account.unrealized_pnl,
+            )
+        except Exception:
+            log.exception("Error guardando broker sync")
 
     # ── Fase 1: Contexto H1/H4 (cada 15 min) ──────────────────
 
@@ -159,9 +204,13 @@ class ForexOrchestrator:
         # Generar señales en cualquier sesión (Tokyo, London, NY)
         # La IA no tiene sesgo psicológico — opera todas las sesiones
 
-        # Si no hay cache o es muy viejo, refrescar contexto primero
-        if self._context_needs_refresh():
-            log.info("Cache de contexto vacío/expirado — refrescando...")
+        # Si cache contexto O cache SMC BIAS están vacíos/expirados, refrescar
+        if self._context_needs_refresh() or self._smc_bias_needs_refresh():
+            log.info(
+                "Cache contexto/BIAS expirado — refrescando "
+                "(ctx_age=%s, bias_age=%s)",
+                self._context_updated_at, self._smc_bias_updated_at,
+            )
             await self.run_context_cycle()
 
         try:
@@ -208,28 +257,49 @@ class ForexOrchestrator:
                         if config.signal_type == "smc_institutional":
                             entry_data = candle_cache.get(config.entry_timeframe, {})
                             h1_data = candle_cache.get("H1", {})
-                            improvement_rules = await self._load_improvement_rules(session, config.id)
-                            generator = SMCSignalGenerator(config, improvement_rules)
-                            signals = generator.scan_entries(self._smc_bias_cache, entry_data, h1_data)
+                            if not self._smc_bias_cache:
+                                log.warning(
+                                    "[%s] BIAS cache vacío — esperando próximo ciclo de contexto",
+                                    config.id,
+                                )
+                                signals = []
+                            elif not entry_data:
+                                log.warning(
+                                    "[%s] Sin candles %s en cache — skip",
+                                    config.id, config.entry_timeframe,
+                                )
+                                signals = []
+                            else:
+                                improvement_rules = await self._load_improvement_rules(session, config.id)
+                                generator = SMCSignalGenerator(config, improvement_rules)
+                                signals = generator.scan_entries(self._smc_bias_cache, entry_data, h1_data)
 
                         elif config.signal_type == "turtle_breakout":
                             entry_data = candle_cache.get(config.entry_timeframe, {})
-                            if entry_data:
+                            if not entry_data:
+                                log.warning(
+                                    "[%s] Sin candles %s en cache — skip",
+                                    config.id, config.entry_timeframe,
+                                )
+                                signals = []
+                            else:
                                 last_results = getattr(self, "_turtle_last_breakout", {})
                                 improvement_rules = await self._load_improvement_rules(session, config.id)
                                 gen = TurtleSignalGenerator(config, improvement_rules, last_results)
                                 signals = gen.scan_entries(entry_data)
-                            else:
-                                signals = []
 
                         elif config.signal_type == "connors_rsi2":
                             entry_data = candle_cache.get(config.entry_timeframe, {})
-                            if entry_data:
+                            if not entry_data:
+                                log.warning(
+                                    "[%s] Sin candles %s en cache — skip",
+                                    config.id, config.entry_timeframe,
+                                )
+                                signals = []
+                            else:
                                 improvement_rules = await self._load_improvement_rules(session, config.id)
                                 gen = ConnorsSignalGenerator(config, improvement_rules)
                                 signals = gen.scan_entries(entry_data)
-                            else:
-                                signals = []
 
                         else:
                             # S1/S2: usar context cache + M1 entries
@@ -254,6 +324,42 @@ class ForexOrchestrator:
                         signals = []
 
                     for signal in signals:
+                        # News blackout: no abrir trades 5 min antes / 15 min después de news high-impact
+                        blackout, event = await self._economic_calendar.is_blackout(
+                            signal.instrument,
+                        )
+                        if blackout:
+                            log.info(
+                                "[%s] %s: BLACKOUT por news '%s' (%s) — skip entrada",
+                                strategy_id, signal.instrument,
+                                event.title if event else "?",
+                                event.time.strftime("%H:%M UTC") if event else "?",
+                            )
+                            continue
+
+                        # Vision validator (POC) — solo para S1/S2 inicialmente
+                        if self._vision_validator.enabled and strategy_id in (
+                            "s1_pullback_20_up", "s2_pullback_20_down",
+                        ):
+                            entry_candles = candle_cache.get(
+                                config.entry_timeframe, {},
+                            ).get(signal.instrument, [])
+                            if entry_candles:
+                                validation = await self._vision_validator.validate_entry(
+                                    signal, entry_candles, strategy_id,
+                                )
+                                log.info(
+                                    "[%s] %s VISION: valid=%s conf=%.2f reason=%s",
+                                    strategy_id, signal.instrument,
+                                    validation.valid, validation.confidence, validation.reason,
+                                )
+                                if not validation.valid or validation.confidence < settings.vision_min_confidence:
+                                    log.info(
+                                        "[%s] %s: Vision rechaza entrada — skip",
+                                        strategy_id, signal.instrument,
+                                    )
+                                    continue
+
                         traded = await self._execute_signal(session, signal, strategy_id)
                         if traded:
                             total_trades += 1
@@ -287,6 +393,17 @@ class ForexOrchestrator:
         if not self._context_cache or self._context_updated_at is None:
             return True
         age = (datetime.now(timezone.utc) - self._context_updated_at).total_seconds()
+        return age > self._CONTEXT_MAX_AGE_SEC
+
+    def _smc_bias_needs_refresh(self) -> bool:
+        """True si el cache BIAS de S3 está vacío o expirado.
+
+        Verifica independientemente del context cache de S1/S2 — si S3 tiene
+        BIAS vacío, debemos refrescar aunque S1/S2 estén OK.
+        """
+        if not self._smc_bias_cache or self._smc_bias_updated_at is None:
+            return True
+        age = (datetime.now(timezone.utc) - self._smc_bias_updated_at).total_seconds()
         return age > self._CONTEXT_MAX_AGE_SEC
 
     async def _fetch_all_candles(self) -> dict[str, dict[str, list[Candle]]]:
@@ -352,37 +469,6 @@ class ForexOrchestrator:
             config.id, len(ready), len(smc_data),
             f" ({', '.join(f'{i}={bias_results[i]}' for i in ready)})" if ready else "",
         )
-
-    async def _run_smc_entries(
-        self, session: AsyncSession, config: "StrategyConfig",
-    ) -> list[ForexSignal]:
-        """Fase 2 SMC: buscar entradas en M5 para instrumentos con BIAS."""
-        # Filter instruments with active BIAS
-        ready_instruments = [
-            inst for inst in config.instruments
-            if self._smc_bias_cache.get(inst, "NEUTRAL") != "NEUTRAL"
-        ]
-        if not ready_instruments:
-            return []
-
-        # Fetch M5 candles
-        entry_data = await self._fetch_entry_candles(ready_instruments, config.entry_timeframe)
-        if not entry_data:
-            return []
-
-        # Also fetch H1 for MarketState in signals
-        h1_data: dict[str, list[Candle]] = {}
-        for inst in ready_instruments:
-            try:
-                candles_h1 = await self._broker.get_candles(inst, "H1", 250)
-                if candles_h1:
-                    h1_data[inst] = candles_h1
-            except Exception:
-                pass
-
-        improvement_rules = await self._load_improvement_rules(session, config.id)
-        generator = SMCSignalGenerator(config, improvement_rules)
-        return generator.scan_entries(self._smc_bias_cache, entry_data, h1_data)
 
     def _check_daily_trade_limit(self, strategy_id: str, config) -> bool:
         """Verifica si la estrategia ya alcanzó su límite diario de trades."""
@@ -753,7 +839,7 @@ class ForexOrchestrator:
         now = datetime.now(timezone.utc)
         is_eod = now.hour == 20 and now.minute >= 45
 
-        # Para posiciones abiertas: gestionar trailing, EOD close
+        # Para posiciones abiertas: gestionar trailing, EOD close, news close
         for position in broker_positions:
             if position.trade_id not in db_trades:
                 db_trade = await self._adopt_broker_position(session, position)
@@ -767,7 +853,53 @@ class ForexOrchestrator:
                 await self._close_position_eod(session, db_trade, position)
                 continue
 
+            # News close: cerrar 5 min antes de news high-impact
+            upcoming = await self._economic_calendar.upcoming_event_for(
+                db_trade.instrument, within_minutes=5,
+            )
+            if upcoming:
+                log.info(
+                    "[%s] Cerrando %s antes de news '%s' (%s)",
+                    db_trade.strategy_id, db_trade.instrument,
+                    upcoming.title, upcoming.time.strftime("%H:%M UTC"),
+                )
+                await self._close_position_news(session, db_trade, position, upcoming.title)
+                continue
+
             await self._manage_single_position(session, db_trade, position)
+
+    async def _close_position_news(
+        self, session: AsyncSession, trade: Trade, position, news_title: str,
+    ) -> None:
+        """Cierre antes de news high-impact — protección contra slippage."""
+        result = await self._broker.close_trade(position.trade_id)
+        if result.success:
+            trade.status = "CLOSED"
+            trade.closed_at = datetime.now(timezone.utc)
+            trade.exit_price = result.fill_price or position.entry_price
+            trade.exit_reason = f"NEWS:{news_title[:40]}"
+
+            # P&L con conversión JPY
+            if trade.direction == "BUY":
+                trade.pnl = (trade.exit_price - trade.entry_price) * trade.quantity
+            else:
+                trade.pnl = (trade.entry_price - trade.exit_price) * trade.quantity
+            if trade.instrument and "_JPY" in trade.instrument:
+                trade.pnl = trade.pnl / trade.exit_price
+
+            state = await self._ensure_state(session, trade.strategy_id)
+            state.positions_open = max(0, state.positions_open - 1)
+            state.total_pnl += trade.pnl or 0
+            if (trade.pnl or 0) >= 0:
+                state.trades_won += 1
+            else:
+                state.trades_lost += 1
+
+            log.info(
+                "[%s] News close: %s %s exit=%.5f pnl=%.2f reason=%s",
+                trade.strategy_id, trade.direction, trade.instrument,
+                trade.exit_price, trade.pnl or 0, trade.exit_reason,
+            )
 
     async def _close_position_eod(
         self, session: AsyncSession, trade: Trade, position,
